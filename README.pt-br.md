@@ -7,7 +7,7 @@ O **AER** é um módulo PowerShell 7 que conecta no Azure com as suas credenciai
 > 🌐 **English:** veja [README.md](README.md) (versão principal)
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell&logoColor=white)](https://learn.microsoft.com/powershell/)
-[![Publicar PowerShell Gallery](https://github.com/TrimTechBr/azure-state-report/actions/workflows/publish-powershell-gallery.yml/badge.svg?branch=develop)](https://github.com/TrimTechBr/azure-state-report/actions/workflows/publish-powershell-gallery.yml)
+[![Publish PowerShell Gallery](https://github.com/TrimTechBr/azure-estate-report/actions/workflows/publish-powershell-gallery.yml/badge.svg)](https://github.com/TrimTechBr/azure-estate-report/actions/workflows/publish-powershell-gallery.yml)
 [![Somente leitura](https://img.shields.io/badge/modo-somente%20leitura-2ea44f)](#-seguran%C3%A7a--privacidade)
 [![Licença: MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-blue)](#-licen%C3%A7a)
 
