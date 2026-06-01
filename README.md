@@ -7,7 +7,7 @@
 > 🌐 **Português:** see [README.pt-br.md](README.pt-br.md)
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell&logoColor=white)](https://learn.microsoft.com/powershell/)
-[![Publish PowerShell Gallery](https://github.com/TrimTechBr/azure-state-report/actions/workflows/publish-powershell-gallery.yml/badge.svg?branch=develop)](https://github.com/TrimTechBr/azure-state-report/actions/workflows/publish-powershell-gallery.yml)
+[![Publish PowerShell Gallery](https://github.com/TrimTechBr/azure-estate-report/actions/workflows/publish-powershell-gallery.yml/badge.svg)](https://github.com/TrimTechBr/azure-estate-report/actions/workflows/publish-powershell-gallery.yml)
 [![Read-only](https://img.shields.io/badge/mode-read--only-2ea44f)](#-security--privacy)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](#-license)
 
