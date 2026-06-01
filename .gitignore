@@ -1,0 +1,6 @@
+.superpowers/
+
+# Local report output and debug artifacts
+output-test/
+aer-report/
+aer-debug.txt

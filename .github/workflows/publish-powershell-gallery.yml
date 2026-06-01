@@ -1,0 +1,595 @@
+name: Publish PowerShell Gallery
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]*'
+
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish, for example v0.1.6-alpha'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  MODULE_NAME: AER
+  MODULE_MANIFEST: AER.psd1
+  MODULE_ROOT_MODULE: AER.psm1
+  MODULE_COMMAND: Invoke-AERReport
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+
+jobs:
+  guard:
+    name: Ensure tag is on main
+    runs-on: ubuntu-latest
+    outputs:
+      on_main: ${{ steps.check.outputs.on_main }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Check that the tag commit is on main
+        id: check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # git merge-base --is-ancestor returns a non-zero exit code by design;
+          # don't let pwsh turn that expected exit code into a terminating error.
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_TAG)) {
+            throw "Release tag was not resolved. Use a tag push or provide workflow_dispatch input 'release_tag'."
+          }
+
+          Write-Host "Release tag: $env:RELEASE_TAG"
+
+          # Make sure the main branch is available locally for the ancestry check.
+          git fetch origin main:refs/remotes/origin/main 2>$null
+
+          $tagSha = (git rev-parse HEAD).Trim()
+          Write-Host "Tag commit: $tagSha"
+
+          # A commit is "on main" when it is reachable from origin/main.
+          # A commit is its own ancestor, so a tag on the main tip also passes.
+          git merge-base --is-ancestor $tagSha origin/main
+          $code = $LASTEXITCODE
+
+          switch ($code) {
+            0 {
+              $isOnMain = $true
+              Write-Host "Tag commit is on main. Pipeline will run."
+            }
+            1 {
+              $isOnMain = $false
+              Write-Host "Tag commit is NOT on main. Pipeline will be skipped."
+            }
+            default {
+              throw "git merge-base --is-ancestor failed unexpectedly with exit code $code."
+            }
+          }
+
+          "on_main=$($isOnMain.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+  validate:
+    name: Validate module
+    runs-on: ubuntu-latest
+    needs: guard
+    if: needs.guard.outputs.on_main == 'true'
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install PowerShell dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+
+          Install-Module `
+            -Name Az.Accounts, Az.ResourceGraph `
+            -Scope CurrentUser `
+            -Repository PSGallery `
+            -Force `
+            -AllowClobber `
+            -AcceptLicense
+
+      - name: Validate module manifest and exported command
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-ManifestGalleryVersion {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string] $ManifestPath
+            )
+
+            $manifestData = Import-PowerShellDataFile -Path $ManifestPath
+
+            if (-not $manifestData.ContainsKey('ModuleVersion')) {
+              throw "ModuleVersion was not found in module manifest '$ManifestPath'."
+            }
+
+            $moduleVersion = [version]$manifestData.ModuleVersion
+            $prerelease = $null
+
+            if (
+              $manifestData.ContainsKey('PrivateData') -and
+              $null -ne $manifestData.PrivateData -and
+              $manifestData.PrivateData.ContainsKey('PSData') -and
+              $null -ne $manifestData.PrivateData.PSData -and
+              $manifestData.PrivateData.PSData.ContainsKey('Prerelease')
+            ) {
+              $prerelease = $manifestData.PrivateData.PSData.Prerelease
+            }
+
+            $isPrerelease = -not [string]::IsNullOrWhiteSpace($prerelease)
+
+            if ($isPrerelease) {
+              if ($prerelease -notmatch '^[0-9A-Za-z-]+$') {
+                throw "Invalid Prerelease value '$prerelease'. Use only letters, numbers, and hyphen. Do not use dots or plus signs."
+              }
+
+              $galleryVersion = "$moduleVersion-$prerelease"
+            }
+            else {
+              $galleryVersion = $moduleVersion.ToString()
+            }
+
+            [pscustomobject]@{
+              ModuleVersion  = $moduleVersion
+              Prerelease     = $prerelease
+              IsPrerelease   = $isPrerelease
+              GalleryVersion = $galleryVersion
+            }
+          }
+
+          $manifestPath = Join-Path $PWD $env:MODULE_MANIFEST
+
+          if (-not (Test-Path -LiteralPath $manifestPath)) {
+            throw "Module manifest not found: $manifestPath"
+          }
+
+          $manifest = Test-ModuleManifest -Path $manifestPath
+          $versionInfo = Get-ManifestGalleryVersion -ManifestPath $manifestPath
+
+          if ($manifest.Name -ne $env:MODULE_NAME) {
+            throw "Unexpected module name '$($manifest.Name)'. Expected '$env:MODULE_NAME'."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($manifest.Description)) {
+            throw "Module manifest Description is required for PowerShell Gallery publishing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($manifest.Author)) {
+            throw "Module manifest Author is required for PowerShell Gallery publishing."
+          }
+
+          Import-Module $manifestPath -Force
+
+          if (-not (Get-Command $env:MODULE_COMMAND -ErrorAction SilentlyContinue)) {
+            throw "Expected exported command '$env:MODULE_COMMAND' was not found in module '$($manifest.Name)'."
+          }
+
+          Write-Host "Module validation completed successfully."
+          Write-Host "Module name: $($manifest.Name)"
+          Write-Host "Module version from manifest: $($versionInfo.ModuleVersion)"
+          Write-Host "Module prerelease from manifest: $($versionInfo.Prerelease)"
+          Write-Host "PowerShell Gallery version: $($versionInfo.GalleryVersion)"
+          Write-Host "Description: $($manifest.Description)"
+
+      - name: Stage module package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-ManifestGalleryVersion {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string] $ManifestPath
+            )
+
+            $manifestData = Import-PowerShellDataFile -Path $ManifestPath
+
+            if (-not $manifestData.ContainsKey('ModuleVersion')) {
+              throw "ModuleVersion was not found in module manifest '$ManifestPath'."
+            }
+
+            $moduleVersion = [version]$manifestData.ModuleVersion
+            $prerelease = $null
+
+            if (
+              $manifestData.ContainsKey('PrivateData') -and
+              $null -ne $manifestData.PrivateData -and
+              $manifestData.PrivateData.ContainsKey('PSData') -and
+              $null -ne $manifestData.PrivateData.PSData -and
+              $manifestData.PrivateData.PSData.ContainsKey('Prerelease')
+            ) {
+              $prerelease = $manifestData.PrivateData.PSData.Prerelease
+            }
+
+            $isPrerelease = -not [string]::IsNullOrWhiteSpace($prerelease)
+
+            if ($isPrerelease) {
+              if ($prerelease -notmatch '^[0-9A-Za-z-]+$') {
+                throw "Invalid Prerelease value '$prerelease'. Use only letters, numbers, and hyphen. Do not use dots or plus signs."
+              }
+
+              $galleryVersion = "$moduleVersion-$prerelease"
+            }
+            else {
+              $galleryVersion = $moduleVersion.ToString()
+            }
+
+            [pscustomobject]@{
+              ModuleVersion  = $moduleVersion
+              Prerelease     = $prerelease
+              IsPrerelease   = $isPrerelease
+              GalleryVersion = $galleryVersion
+            }
+          }
+
+          $stagingRoot = Join-Path $env:RUNNER_TEMP 'module-package'
+          $moduleRoot = Join-Path $stagingRoot $env:MODULE_NAME
+
+          if (Test-Path -LiteralPath $stagingRoot) {
+            Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+          }
+
+          New-Item -Path $moduleRoot -ItemType Directory -Force | Out-Null
+
+          $include = @(
+            'AER.psd1',
+            'AER.psm1',
+            'Collectors',
+            'Core',
+            'Public',
+            'Renderer',
+            'LICENSE',
+            'README.md',
+            'README.pt-br.md'
+          )
+
+          foreach ($item in $include) {
+            if (-not (Test-Path -LiteralPath $item)) {
+              throw "Required module package item not found: $item"
+            }
+
+            Copy-Item `
+              -Path $item `
+              -Destination $moduleRoot `
+              -Recurse `
+              -Force
+          }
+
+          $stagedManifestPath = Join-Path $moduleRoot $env:MODULE_MANIFEST
+          $manifest = Test-ModuleManifest -Path $stagedManifestPath
+          $versionInfo = Get-ManifestGalleryVersion -ManifestPath $stagedManifestPath
+
+          if ($manifest.Name -ne $env:MODULE_NAME) {
+            throw "Unexpected staged module name '$($manifest.Name)'. Expected '$env:MODULE_NAME'."
+          }
+
+          Write-Host "Module package staged successfully at: $moduleRoot"
+          Write-Host "Staged module version: $($versionInfo.GalleryVersion)"
+
+      - name: Upload module package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AER-module
+          path: ${{ runner.temp }}/module-package
+          if-no-files-found: error
+
+  publish:
+    name: Publish module
+    runs-on: ubuntu-latest
+    needs: [guard, validate]
+    if: needs.guard.outputs.on_main == 'true' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
+    # environment: powershell-gallery
+
+    steps:
+      - name: Download module package
+        uses: actions/download-artifact@v4
+        with:
+          name: AER-module
+          path: module-package
+
+      - name: Install publish dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+
+          Install-Module `
+            -Name PowerShellGet, Az.Accounts, Az.ResourceGraph `
+            -Scope CurrentUser `
+            -Repository PSGallery `
+            -Force `
+            -AllowClobber `
+            -AcceptLicense
+
+      - name: Resolve version from module manifest
+        id: version
+        shell: pwsh
+        env:
+          GITHUB_REF_NAME_VALUE: ${{ github.ref_name }}
+          GITHUB_REF_TYPE_VALUE: ${{ github.ref_type }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-ManifestGalleryVersion {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string] $ManifestPath
+            )
+
+            $manifestData = Import-PowerShellDataFile -Path $ManifestPath
+
+            if (-not $manifestData.ContainsKey('ModuleVersion')) {
+              throw "ModuleVersion was not found in module manifest '$ManifestPath'."
+            }
+
+            $moduleVersion = [version]$manifestData.ModuleVersion
+            $prerelease = $null
+
+            if (
+              $manifestData.ContainsKey('PrivateData') -and
+              $null -ne $manifestData.PrivateData -and
+              $manifestData.PrivateData.ContainsKey('PSData') -and
+              $null -ne $manifestData.PrivateData.PSData -and
+              $manifestData.PrivateData.PSData.ContainsKey('Prerelease')
+            ) {
+              $prerelease = $manifestData.PrivateData.PSData.Prerelease
+            }
+
+            $isPrerelease = -not [string]::IsNullOrWhiteSpace($prerelease)
+
+            if ($isPrerelease) {
+              if ($prerelease -notmatch '^[0-9A-Za-z-]+$') {
+                throw "Invalid Prerelease value '$prerelease'. Use only letters, numbers, and hyphen. Do not use dots or plus signs."
+              }
+
+              $galleryVersion = "$moduleVersion-$prerelease"
+            }
+            else {
+              $galleryVersion = $moduleVersion.ToString()
+            }
+
+            [pscustomobject]@{
+              ModuleVersion  = $moduleVersion
+              Prerelease     = $prerelease
+              IsPrerelease   = $isPrerelease
+              GalleryVersion = $galleryVersion
+            }
+          }
+
+          $moduleRoot = Join-Path (Join-Path $PWD 'module-package') $env:MODULE_NAME
+          $manifestPath = Join-Path $moduleRoot $env:MODULE_MANIFEST
+
+          if (-not (Test-Path -LiteralPath $moduleRoot)) {
+            throw "Module root not found: $moduleRoot"
+          }
+
+          if (-not (Test-Path -LiteralPath $manifestPath)) {
+            throw "Module manifest not found: $manifestPath"
+          }
+
+          $manifest = Test-ModuleManifest -Path $manifestPath
+          $versionInfo = Get-ManifestGalleryVersion -ManifestPath $manifestPath
+
+          if ($manifest.Name -ne $env:MODULE_NAME) {
+            throw "Unexpected module name '$($manifest.Name)'. Expected '$env:MODULE_NAME'."
+          }
+
+          Write-Host "Resolved version from module manifest."
+          Write-Host "Module name: $($manifest.Name)"
+          Write-Host "ModuleVersion: $($versionInfo.ModuleVersion)"
+          Write-Host "Prerelease: $($versionInfo.Prerelease)"
+          Write-Host "PowerShell Gallery version: $($versionInfo.GalleryVersion)"
+
+          $rawTag = $env:RELEASE_TAG
+
+          if ([string]::IsNullOrWhiteSpace($rawTag)) {
+            if ($env:GITHUB_REF_TYPE_VALUE -eq 'tag') {
+              $rawTag = $env:GITHUB_REF_NAME_VALUE
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($rawTag)) {
+            throw "No release tag detected. This workflow requires either a tag push or workflow_dispatch input 'release_tag'."
+          }
+
+          $cleanTag = $rawTag.Trim()
+          $tagVersion = $cleanTag -replace '^[vV]', ''
+
+          Write-Host "GitHub tag detected: $cleanTag"
+          Write-Host "Version represented by tag: $tagVersion"
+
+          if ($tagVersion -ne $versionInfo.GalleryVersion) {
+            throw "GitHub tag version '$tagVersion' does not match module manifest version '$($versionInfo.GalleryVersion)'. Update AER.psd1 or create a matching tag."
+          }
+
+          Write-Host "GitHub tag matches module manifest version."
+
+          "module_name=$($manifest.Name)" >> $env:GITHUB_OUTPUT
+          "module_version=$($versionInfo.ModuleVersion)" >> $env:GITHUB_OUTPUT
+          "prerelease=$($versionInfo.Prerelease)" >> $env:GITHUB_OUTPUT
+          "is_prerelease=$($versionInfo.IsPrerelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "gallery_version=$($versionInfo.GalleryVersion)" >> $env:GITHUB_OUTPUT
+
+      - name: Publish to PowerShell Gallery
+        shell: pwsh
+        env:
+          PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+          MODULE_VERSION_FROM_MANIFEST: ${{ steps.version.outputs.module_version }}
+          MODULE_PRERELEASE_FROM_MANIFEST: ${{ steps.version.outputs.prerelease }}
+          IS_PRERELEASE: ${{ steps.version.outputs.is_prerelease }}
+          GALLERY_VERSION: ${{ steps.version.outputs.gallery_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Test-PublishedModuleVersion {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string] $Name,
+
+              [Parameter(Mandatory = $true)]
+              [string] $Version,
+
+              [Parameter(Mandatory = $true)]
+              [bool] $IsPrerelease
+            )
+
+            $findParams = @{
+              Name            = $Name
+              Repository      = 'PSGallery'
+              RequiredVersion = $Version
+              ErrorAction     = 'SilentlyContinue'
+            }
+
+            if ($IsPrerelease) {
+              $findParams.AllowPrerelease = $true
+            }
+
+            try {
+              $found = Find-Module @findParams
+
+              if ($null -ne $found) {
+                return $true
+              }
+            }
+            catch {
+              Write-Warning "Exact Find-Module check failed for '$Name' version '$Version'. The publish step will still handle duplicate conflicts safely. Error: $($_.Exception.Message)"
+            }
+
+            return $false
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:PSGALLERY_API_KEY)) {
+            throw 'GitHub secret PSGALLERY_API_KEY is required to publish to PowerShell Gallery.'
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:MODULE_VERSION_FROM_MANIFEST)) {
+            throw 'Module version resolved from module manifest is empty.'
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:GALLERY_VERSION)) {
+            throw 'PowerShell Gallery version resolved from module manifest is empty.'
+          }
+
+          $moduleRoot = Join-Path (Join-Path $PWD 'module-package') $env:MODULE_NAME
+          $manifestPath = Join-Path $moduleRoot $env:MODULE_MANIFEST
+
+          if (-not (Test-Path -LiteralPath $moduleRoot)) {
+            throw "Module root not found: $moduleRoot"
+          }
+
+          if (-not (Test-Path -LiteralPath $manifestPath)) {
+            throw "Module manifest not found: $manifestPath"
+          }
+
+          $manifest = Test-ModuleManifest -Path $manifestPath
+          $manifestData = Import-PowerShellDataFile -Path $manifestPath
+
+          if ($manifest.Name -ne $env:MODULE_NAME) {
+            throw "Unexpected module name '$($manifest.Name)'. Expected '$env:MODULE_NAME'."
+          }
+
+          $moduleVersion = [version]$manifestData.ModuleVersion
+          $expectedModuleVersion = [version]$env:MODULE_VERSION_FROM_MANIFEST
+
+          if ($moduleVersion.ToString() -ne $expectedModuleVersion.ToString()) {
+            throw "Manifest version '$moduleVersion' does not match resolved version '$expectedModuleVersion'."
+          }
+
+          $prerelease = $null
+
+          if (
+            $manifestData.ContainsKey('PrivateData') -and
+            $null -ne $manifestData.PrivateData -and
+            $manifestData.PrivateData.ContainsKey('PSData') -and
+            $null -ne $manifestData.PrivateData.PSData -and
+            $manifestData.PrivateData.PSData.ContainsKey('Prerelease')
+          ) {
+            $prerelease = $manifestData.PrivateData.PSData.Prerelease
+          }
+
+          $isPrerelease = $env:IS_PRERELEASE -eq 'true'
+
+          if ($isPrerelease) {
+            if ($prerelease -ne $env:MODULE_PRERELEASE_FROM_MANIFEST) {
+              throw "Manifest prerelease '$prerelease' does not match resolved prerelease '$env:MODULE_PRERELEASE_FROM_MANIFEST'."
+            }
+          }
+          else {
+            if (-not [string]::IsNullOrWhiteSpace($prerelease)) {
+              throw "Stable release expected, but manifest contains Prerelease '$prerelease'."
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($manifest.Description)) {
+            throw "Module manifest Description is required for PowerShell Gallery publishing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($manifest.Author)) {
+            throw "Module manifest Author is required for PowerShell Gallery publishing."
+          }
+
+          Write-Host "Checking whether module '$($manifest.Name)' version '$env:GALLERY_VERSION' already exists in PowerShell Gallery."
+
+          $alreadyPublished = Test-PublishedModuleVersion `
+            -Name $manifest.Name `
+            -Version $env:GALLERY_VERSION `
+            -IsPrerelease $isPrerelease
+
+          if ($alreadyPublished) {
+            Write-Host "Module '$($manifest.Name)' version '$env:GALLERY_VERSION' already exists in PowerShell Gallery. Skipping publish."
+            exit 0
+          }
+
+          Write-Host "Publishing module '$($manifest.Name)' version '$env:GALLERY_VERSION' to PowerShell Gallery."
+
+          $publishParams = @{
+            Path        = $moduleRoot
+            Repository  = 'PSGallery'
+            NuGetApiKey = $env:PSGALLERY_API_KEY
+            Force       = $true
+            ErrorAction = 'Stop'
+          }
+
+          try {
+            Publish-Module @publishParams
+            Write-Host "Module '$($manifest.Name)' version '$env:GALLERY_VERSION' published successfully."
+          }
+          catch {
+            $errorMessage = $_.Exception.Message
+
+            if (
+              $errorMessage -match '409' -or
+              $errorMessage -match 'Conflict' -or
+              $errorMessage -match 'already exists' -or
+              $errorMessage -match 'cannot be modified'
+            ) {
+              Write-Warning "Module '$($manifest.Name)' version '$env:GALLERY_VERSION' already exists in PowerShell Gallery. Treating this as successful/idempotent."
+              exit 0
+            }
+
+            throw
+          }

@@ -1,0 +1,151 @@
+name: Auto-tag release on main
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'AER.psd1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  MODULE_MANIFEST: AER.psd1
+  PUBLISH_WORKFLOW_FILE: publish-powershell-gallery.yml
+
+jobs:
+  auto-tag:
+    name: Create release tag and trigger publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version from module manifest
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $manifestPath = Join-Path $PWD $env:MODULE_MANIFEST
+
+          if (-not (Test-Path -LiteralPath $manifestPath)) {
+            throw "Module manifest not found: $manifestPath"
+          }
+
+          $manifestData = Import-PowerShellDataFile -Path $manifestPath
+
+          if (-not $manifestData.ContainsKey('ModuleVersion')) {
+            throw "ModuleVersion was not found in module manifest '$manifestPath'."
+          }
+
+          $moduleVersion = ([version]$manifestData.ModuleVersion).ToString()
+
+          $prerelease = $null
+
+          if (
+            $manifestData.ContainsKey('PrivateData') -and
+            $null -ne $manifestData.PrivateData -and
+            $manifestData.PrivateData.ContainsKey('PSData') -and
+            $null -ne $manifestData.PrivateData.PSData -and
+            $manifestData.PrivateData.PSData.ContainsKey('Prerelease')
+          ) {
+            $prerelease = $manifestData.PrivateData.PSData.Prerelease
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($prerelease)) {
+            if ($prerelease -notmatch '^[0-9A-Za-z-]+$') {
+              throw "Invalid Prerelease value '$prerelease'. Use only letters, numbers, and hyphen. Do not use dots or plus signs."
+            }
+
+            $galleryVersion = "$moduleVersion-$prerelease"
+          }
+          else {
+            $galleryVersion = $moduleVersion
+          }
+
+          $tag = "v$galleryVersion"
+
+          Write-Host "Module version : $moduleVersion"
+          Write-Host "Prerelease     : $prerelease"
+          Write-Host "Gallery version: $galleryVersion"
+          Write-Host "Resolved tag   : $tag"
+
+          "module_version=$moduleVersion" >> $env:GITHUB_OUTPUT
+          "prerelease=$prerelease" >> $env:GITHUB_OUTPUT
+          "gallery_version=$galleryVersion" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Create tag if missing
+        id: tag
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Invoke-Git {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string[]] $Arguments
+            )
+
+            & git @Arguments
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Git command failed with exit code ${LASTEXITCODE}: git $($Arguments -join ' ')"
+            }
+          }
+
+          $tag = '${{ steps.version.outputs.tag }}'
+
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          $existing = & git ls-remote --tags origin "refs/tags/$tag"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to query remote tags."
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($existing)) {
+            Write-Host "Tag '$tag' already exists on origin. Nothing to create."
+            "created=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          Invoke-Git -Arguments @(
+            'tag',
+            '-a',
+            $tag,
+            '-m',
+            "Release $tag"
+          )
+
+          Invoke-Git -Arguments @(
+            'push',
+            'origin',
+            "refs/tags/$tag"
+          )
+
+          Write-Host "Created and pushed tag '$tag'."
+          "created=true" >> $env:GITHUB_OUTPUT
+
+      - name: Trigger publish workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          PUBLISH_WORKFLOW_FILE: ${{ env.PUBLISH_WORKFLOW_FILE }}
+        run: |
+          set -euo pipefail
+
+          echo "Triggering publish workflow for tag: ${RELEASE_TAG}"
+
+          gh workflow run "${PUBLISH_WORKFLOW_FILE}" \
+            --ref main \
+            -f release_tag="${RELEASE_TAG}"
